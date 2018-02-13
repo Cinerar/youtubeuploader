@@ -490,8 +490,14 @@ func LoadVideoMeta(filename string, video *youtube.Video) (videoMeta VideoMeta) 
 		video.Snippet.Title = videoMeta.Title
 		video.Snippet.Description = videoMeta.Description
 		video.Snippet.CategoryId = videoMeta.CategoryId
+
+		video.Status.License = videoMeta.License
+		video.Status.Embeddable = videoMeta.Embeddable
+		video.Status.PublicStatsViewable = videoMeta.PublicStatsViewable
+
 		if videoMeta.PrivacyStatus != "" {
 			video.Status.PrivacyStatus = videoMeta.PrivacyStatus
+			video.Status.PublishAt = videoMeta.PublishAt
 		}
 		if videoMeta.Location != nil {
 			video.RecordingDetails.Location = videoMeta.Location
