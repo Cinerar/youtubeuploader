@@ -287,7 +287,7 @@ func ResumableUpload(service *youtube.Service, parts string, video *youtube.Vide
 	backoff := minBackoff
 
 	// Retry as many times as needed
-	for err != nil || resp.StatusCode != http.StatusCreated {
+	for err != nil || resp.StatusCode >= 400 {
 		if err != ErrColdResume {
 			if err != nil {
 				log.Println("video upload request failed temporarily with error:", err)
