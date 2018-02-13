@@ -15,13 +15,16 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -30,6 +33,7 @@ import (
 	"github.com/porjo/go-flowrate/flowrate"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
+	"google.golang.org/api/gensupport"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/youtube/v3"
 )
@@ -47,6 +51,7 @@ var (
 	limitBetween = flag.String("limitBetween", "00:00-23:59", "Only rate limit between these times (local time zone)")
 	metaJSON     = flag.String("metaJSON", "", "JSON file containing title,description,tags etc (optional)")
 	headlessAuth = flag.Bool("headlessAuth", false, "set this if host does not have browser available for oauth authorisation step")
+	resume       = flag.Bool("resume", false, "Try to resume the previous upload in the case of a power failure or the program crashing")
 )
 
 type VideoMeta struct {
@@ -95,12 +100,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	reader, filesize := Open(*filename)
+	reader, reopen, filesize := Open(*filename)
 	defer reader.Close()
 
 	var thumbReader io.ReadCloser
 	if *thumbnail != "" {
-		thumbReader, _ = Open(*thumbnail)
+		thumbReader, _, _ = Open(*thumbnail)
 		defer thumbReader.Close()
 	}
 
@@ -125,9 +130,9 @@ func main() {
 						curRate := float32(s.CurRate)
 						var status string
 						if curRate >= 125000 {
-							status = fmt.Sprintf("Progress: %8.2f Mbps, %d / %d (%s) ETA %8s", curRate/125000, s.Bytes, filesize, s.Progress, s.TimeRem)
+							status = fmt.Sprintf("Progress: %8.2f Mbps, %d / %d (%s) ETA %8s", curRate/125000, filesize-s.BytesRem, filesize, s.Progress, s.TimeRem)
 						} else {
-							status = fmt.Sprintf("Progress: %8.2f kbps, %d / %d (%s) ETA %8s", curRate/125, s.Bytes, filesize, s.Progress, s.TimeRem)
+							status = fmt.Sprintf("Progress: %8.2f kbps, %d / %d (%s) ETA %8s", curRate/125, filesize-s.BytesRem, filesize, s.Progress, s.TimeRem)
 						}
 						fmt.Printf("\r%s\r%s", strings.Repeat(" ", erase), status)
 						erase = len(status)
@@ -175,18 +180,7 @@ func main() {
 
 	fmt.Printf("Uploading file '%s'...\n", *filename)
 
-	var option googleapi.MediaOption
-	var video *youtube.Video
-
-	// our RoundTrip gets bypassed if the filesize < DefaultUploadChunkSize
-	if googleapi.DefaultUploadChunkSize > filesize {
-		option = googleapi.ChunkSize(int(filesize / 2))
-	} else {
-		option = googleapi.ChunkSize(googleapi.DefaultUploadChunkSize)
-	}
-
-	call := service.Videos.Insert("snippet,status,recordingDetails", upload)
-	video, err = call.Media(reader, option).Do()
+	video, err := ResumableUpload(service, "snippet,status,recordingDetails", upload, reader, reopen, filesize, ctx, client)
 
 	quit := make(chan struct{})
 	quitChan <- quit
@@ -217,6 +211,186 @@ func main() {
 	}
 }
 
+var ErrColdResume = errors.New("[resuming from previous session - this error should not be displayed]")
+
+func ResumableUpload(service *youtube.Service, parts string, video *youtube.Video, reader io.Reader, reopenReader func(int64) (io.ReadCloser, error), filesize int64, ctx context.Context, client *http.Client) (*youtube.Video, error) {
+	var resumableSession string
+	if *resume {
+		session, err := ioutil.ReadFile(".youtubeuploader-resume")
+		if err == nil {
+			resumableSession = string(session)
+		}
+	}
+
+	reader1, contentType := gensupport.DetermineContentType(reader, "")
+
+	userAgent := googleapi.UserAgent + " (+https://github.com/porjo/youtubeuploader)"
+
+	var req *http.Request
+	var resp *http.Response
+	var err error
+
+	if resumableSession == "" {
+		query := url.Values{
+			"part":       {parts},
+			"uploadType": {"resumable"},
+		}
+
+		url := strings.Replace(googleapi.ResolveRelative(service.BasePath, "videos"), "https://www.googleapis.com/", "https://www.googleapis.com/upload/", 1) + "?" + query.Encode()
+
+		var body []byte
+		body, err = json.Marshal(video)
+		if err != nil {
+			return nil, err
+		}
+
+		req, err = http.NewRequest("POST", url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+		req.Header.Set("X-Upload-Content-Length", fmt.Sprintf("%d", filesize))
+		req.Header.Set("X-Upload-Content-Type", contentType)
+
+		resp, err = gensupport.SendRequest(ctx, client, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			defer resp.Body.Close()
+			io.Copy(os.Stdout, resp.Body)
+			return nil, fmt.Errorf("unexpected return status from YouTube API: %s", resp.Status)
+		}
+
+		resumableSession = resp.Header.Get("Location")
+		if *resume {
+			err = ioutil.WriteFile(".youtubeuploader-resume", []byte(resumableSession), 0644)
+			if err != nil {
+				log.Println("warning: failed to save session information:", err)
+			}
+		}
+
+		// First attempt: just run the request as normal
+		req, err = http.NewRequest("PUT", resumableSession, reader1)
+		req.ContentLength = filesize
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Content-Length", fmt.Sprintf("%d", filesize))
+		req.Header.Set("Content-Type", contentType)
+
+		resp, err = gensupport.SendRequest(ctx, client, req)
+	} else {
+		err = ErrColdResume
+	}
+
+	minBackoff, maxBackoff := 500*time.Millisecond, 15*time.Minute
+	backoff := minBackoff
+
+	// Retry as many times as needed
+	for err != nil || resp.StatusCode != http.StatusCreated {
+		if err != ErrColdResume {
+			if err != nil {
+				log.Println("video upload request failed temporarily with error:", err)
+			} else {
+				resp.Body.Close()
+
+				// Handle permanent errors
+				if resp.StatusCode >= 400 &&
+					resp.StatusCode != http.StatusInternalServerError &&
+					resp.StatusCode != http.StatusBadGateway &&
+					resp.StatusCode != http.StatusServiceUnavailable &&
+					resp.StatusCode != http.StatusGatewayTimeout {
+					if *resume {
+						os.Remove(".youtubeuploader-resume")
+					}
+					return nil, fmt.Errorf("YouTube API responded to the video upload request with %s", resp.Status)
+				}
+
+				log.Println("video upload request failed temporarily with http status:", resp.Status)
+			}
+
+			log.Println("waiting", backoff, "and trying again")
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+
+		req, err = http.NewRequest("PUT", resumableSession, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Content-Range", fmt.Sprintf("bytes */%d", filesize))
+		req.Header.Set("X-GUploader-No-308", "yes")
+
+		resp, err = gensupport.SendRequest(ctx, client, req)
+		if err != nil {
+			continue
+		}
+		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+			if t, err := http.ParseTime(retryAfter); err == nil {
+				backoff = time.Until(t)
+				continue
+			}
+			if s, err := strconv.ParseInt(retryAfter, 10, 64); err == nil {
+				backoff = time.Second * time.Duration(s)
+				continue
+			}
+		}
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Http-Status-Code-Override") != "308" {
+			continue
+		}
+
+		// Resume incomplete
+		resp.Body.Close()
+		backoff = minBackoff
+		var start int64
+		if byteRange := resp.Header.Get("Range"); strings.HasPrefix(byteRange, "bytes=0-") {
+			start, err = strconv.ParseInt(strings.TrimPrefix(byteRange, "bytes=0-"), 10, 64)
+			if err == nil {
+				start++
+			} else {
+				start = 0
+			}
+		}
+
+		reader2, err := reopenReader(start)
+		if err != nil {
+			log.Println("failed to open reader")
+			continue
+		}
+
+		log.Println("resuming from byte", start, "of", filesize)
+
+		req, err = http.NewRequest("PUT", resumableSession, reader2)
+		req.ContentLength = filesize - start
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Content-Length", strconv.FormatInt(filesize-start, 10))
+		req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, filesize-1, filesize))
+
+		resp, err = gensupport.SendRequest(ctx, client, req)
+		reader2.Close()
+	}
+
+	// Request was successful.
+	defer resp.Body.Close()
+
+	if *resume {
+		os.Remove(".youtubeuploader-resume")
+	}
+
+	response := &youtube.Video{
+		ServerResponse: googleapi.ServerResponse{
+			HTTPStatusCode: resp.StatusCode,
+			Header:         resp.Header,
+		},
+	}
+	err = json.NewDecoder(resp.Body).Decode(response)
+	return response, err
+}
+
 type limitTransport struct {
 	rt       http.RoundTripper
 	times    [2]int
@@ -238,9 +412,10 @@ func (t *limitTransport) RoundTrip(r *http.Request) (res *http.Response, err err
 
 		if monitor != nil {
 			// carry over stats to new limiter
+			monitor.SetTransferSize(monitor.Status().Bytes + r.ContentLength)
 			t.reader.Monitor = monitor
 		} else {
-			t.reader.Monitor.SetTransferSize(t.filesize)
+			t.reader.Monitor.SetTransferSize(r.ContentLength)
 		}
 		r.Body = &limitChecker{t.times, t.reader}
 	}
@@ -349,7 +524,7 @@ errJump:
 	return
 }
 
-func Open(filename string) (reader io.ReadCloser, filesize int64) {
+func Open(filename string) (reader io.ReadCloser, reopen func(int64) (io.ReadCloser, error), filesize int64) {
 	if strings.HasPrefix(filename, "http") {
 		resp, err := http.Head(filename)
 		if err != nil {
@@ -371,6 +546,18 @@ func Open(filename string) (reader io.ReadCloser, filesize int64) {
 			filesize = resp.ContentLength
 		}
 		reader = resp.Body
+		reopen = func(offset int64) (io.ReadCloser, error) {
+			resp, err := http.Get(filename)
+			if err != nil {
+				return nil, err
+			}
+			_, err = io.CopyN(ioutil.Discard, resp.Body, offset)
+			if err != nil {
+				resp.Body.Close()
+				return nil, err
+			}
+			return resp.Body, nil
+		}
 		return
 	}
 
@@ -384,7 +571,13 @@ func Open(filename string) (reader io.ReadCloser, filesize int64) {
 		log.Fatalf("Error stating file %v: %v", filename, err)
 	}
 
-	return file, fileInfo.Size()
+	return file, func(offset int64) (io.ReadCloser, error) {
+		_, err := file.Seek(offset, io.SeekStart)
+		if err != nil {
+			return nil, err
+		}
+		return ioutil.NopCloser(file), nil
+	}, fileInfo.Size()
 }
 
 func parseLimitBetween(between string) ([2]int, error) {

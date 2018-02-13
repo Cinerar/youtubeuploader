@@ -2,8 +2,9 @@
 
 Scripted uploads to youtube.
 
-- upload video files from local disk or from the web.
-- ratelimit upload bandwidth
+- upload video files from local disk or from the web
+- rate-limit upload bandwidth
+- resume uploads that fail due to power or network failures
 
 ## Download
 
@@ -80,6 +81,8 @@ Full list of options:
     	Suppress progress indicator
   -ratelimit int
     	Rate limit upload in kbps. No limit by default
+  -resume
+  	Try to resume the previous upload in the case of a power failure or the program crashing
   -secrets string
     	Client Secrets configuration (default "client_secrets.json")
   -tags string
@@ -89,7 +92,7 @@ Full list of options:
   -title string
     	Video title (default "Video Title")
 ```
-*NOTE:* When specifying a URL as the filename, the data will be streamed through the localhost (download from remote host, then upload to Youtube)
+*NOTE:* When specifying a URL as the filename, the data will be streamed through the localhost (download from remote host, then upload to Youtube). Each retry will request the data again from the start.
 
 
 ### Metadata
