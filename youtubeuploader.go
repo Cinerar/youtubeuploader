@@ -356,7 +356,8 @@ func ResumableUpload(service *youtube.Service, parts string, video *youtube.Vide
 			}
 		}
 
-		reader2, err := reopenReader(start)
+		var reader2 io.ReadCloser
+		reader2, err = reopenReader(start)
 		if err != nil {
 			log.Println("failed to open reader")
 			continue
