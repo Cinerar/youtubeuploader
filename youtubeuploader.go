@@ -46,7 +46,7 @@ var (
 	categoryId   = flag.String("categoryId", "", "Video category Id")
 	tags         = flag.String("tags", "", "Comma separated list of video tags")
 	privacy      = flag.String("privacy", "private", "Video privacy status")
-	quiet        = flag.Bool("quiet", false, "Suppress progress indicator")
+	quiet        = flag.Bool("quiet", false, "Return ONLY uploaded Video ID")
 	rate         = flag.Int("ratelimit", 0, "Rate limit upload in kbps. No limit by default")
 	limitBetween = flag.String("limitBetween", "00:00-23:59", "Only rate limit between these times (local time zone)")
 	metaJSON     = flag.String("metaJSON", "", "JSON file containing title,description,tags etc (optional)")
@@ -177,15 +177,16 @@ func main() {
 	if upload.Snippet.CategoryId == "" && *categoryId != "" {
 		upload.Snippet.CategoryId = *categoryId
 	}
-
-	fmt.Printf("Uploading file '%s'...\n", *filename)
-
+	if !*quiet {
+		fmt.Printf("Uploading file '%s'...\n", *filename)
+	}
 	video, err := ResumableUpload(service, "snippet,status,recordingDetails", upload, reader, reopen, filesize, ctx, client)
 
-	quit := make(chan struct{})
-	quitChan <- quit
-	<-quit
-
+	if !*quiet {
+		quit := make(chan struct{})
+		quitChan <- quit
+		<-quit
+	}
 	if err != nil {
 		if video != nil {
 			log.Fatalf("Error making YouTube API call: %v, %v", err, video.HTTPStatusCode)
@@ -193,8 +194,11 @@ func main() {
 			log.Fatalf("Error making YouTube API call: %v", err)
 		}
 	}
+	if !*quiet {
 	fmt.Printf("\nUpload successful! Video ID: %v\n", video.Id)
-
+	} else {
+		fmt.Printf (video.Id)
+	}
 	if videoMeta.PlaylistID != "" {
 		err = AddVideoToPlaylist(service, videoMeta.PlaylistID, video.Id)
 		if err != nil {
